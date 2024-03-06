@@ -1,5 +1,9 @@
 ﻿using NAudio.CoreAudioApi;
 using NAudio.Wave;
+using NAudio.Wave.SampleProviders;
+using ScottPlot;
+using ScottPlot.Plottables;
+using ScottPlot.WinForms;
 using System;
 using System.Collections.Generic;
 using System.IO;
@@ -16,16 +20,28 @@ namespace AudioSample
         public static AudioManager Instance => _instance.Value;
 
         public bool IsRunning { get; private set; } = false;
-        public int SampleRate => 44100;
-        public int BitDepth => 16;
-        public int Channels => 1;
-        public int BufferMilliseconds => 10;
-        public double NoiseRatio => 20 * Math.Log10(Math.Pow(2, BitDepth - 1) * Math.Pow(3 / 2.0, 1 / 2.0));
-        public WaveFormat Format => WaveFormat.CreateIeeeFloatWaveFormat(SampleRate, 2);
-        //public WaveFormat Format => new WaveFormat(SampleRate, BitDepth, Channels);
+        public int SampleRate { get; private set; } = 48000;
+        public int BitDepth { get; private set; } = 32;
+        public int Channels { get; private set; } = 2;
+        public int BufferMilliseconds { get; private set; } = 20;
+        public bool IsFloat32 { get; private set; } = true;
+        public double SNR => 6.02 * Format.BitsPerSample + 1.761;
+        //public double NoiseLevel => 
 
-        public delegate void FftValueChangedEventHandler(double[] values, double period, int length);
+        public delegate void PeakValueChangedEventHandler(double freq, double power);
+        public event PeakValueChangedEventHandler PeakValueChanged;
+
+        public delegate void FftValueChangedEventHandler(double[] values, double period);
         public event FftValueChangedEventHandler FftValueChanged;
+
+        public WaveFormat Format 
+        {
+            get
+            {
+                return IsFloat32 ? WaveFormat.CreateIeeeFloatWaveFormat(SampleRate, Channels)
+                    : new WaveFormat(SampleRate, BitDepth, Channels);
+            }
+        }
 
         public string[] GetDevices()
         {
@@ -38,7 +54,7 @@ namespace AudioSample
         }
 
         private readonly object _deviceLock = new object();
-        public void SelectDevice(string deviceName)
+        public bool SelectDevice(string deviceName)
         {
             lock (_deviceLock)
             {
@@ -46,198 +62,149 @@ namespace AudioSample
                 {
                     if (name == deviceName)
                     {
-                        _selectedDevice = _devices[_deviceNames.IndexOf(name)];
-                        return;
+                        _device = _devices[_deviceNames.IndexOf(name)];
+                        return true;
                     }
                 }
                 Logging.Logger.Warn($"Device not found : {deviceName}");
+                return false;
             }
         }
 
-        public void StartRecording(string deviceName, string filePath, int timeSeconds = 5)
+        public void Start(string deviceName, int sampleRate, int bitDepth, int channels, bool isFloat32, FormsPlot plot = null)
         {
-            if (IsRunning) return;
-            if (!_deviceNames.Contains(deviceName))
+            SampleRate = sampleRate;
+            BitDepth = bitDepth;
+            Channels = channels;
+            IsFloat32 = isFloat32;
+            this.Start(deviceName, plot);
+        }
+
+        public void Start(string deviceName, FormsPlot plot = null)
+        {
+            if (IsRunning)
             {
-                Logging.Logger.Warn($"Device not found : {deviceName}");
+                Logging.Logger.Warn($"Is running!! - {_device.FriendlyName}");
                 return;
             }
-
-            IsRunning = true;
-            _cts = new CancellationTokenSource();
-
-            var finfo = new FileInfo(filePath);
-            if (!finfo.Directory.Exists)
-            {
-                Logging.Logger.Warn($"Directory not found, will be create ({finfo.DirectoryName})");
-                finfo.Directory.Create();
-                finfo.Refresh();
-            }
-            if (finfo.Exists)
-            {
-                Logging.Logger.Warn($"Old file exist, will be delete ({finfo.FullName})");
-                finfo.Delete();
-                finfo.Refresh();
-            }
-
-            Task.Run(async () =>
-            {
-                try
-                {
-                    _rawDevice = new WasapiCapture(_selectedDevice, true, BufferMilliseconds);
-                    _rawDevice.DataAvailable += WaveIn_DataAvailable;
-                    var fmt = new WaveFormat(SampleRate, BitDepth, Channels);
-                    _rawDevice.WaveFormat = fmt;
-                    _waveWriter = new WaveFileWriter(finfo.FullName, fmt);
-                    _rawDevice.StartRecording();
-                    await Task.Delay(TimeSpan.FromSeconds(timeSeconds), _cts.Token);
-                }
-                catch (Exception ex)
-                {
-                    if (ex is OperationCanceledException || ex is TaskCanceledException)
-                    {
-                        Logging.Logger.Debug("Recording canceled");
-                    }
-                    else
-                    {
-                        Logging.Logger.Error("Unexpected error");
-                        Logging.Logger.Error(ex.ToString());
-                    }
-                }
-                finally
-                {
-                    _cts?.Dispose();
-                    _cts = null;
-                    StopRecording();
-                }
-            }, _cts.Token);
-        }
-
-        public void StopRecording()
-        {
-            if (!IsRunning) return;
-
-            IsRunning = false;
-            _cts?.Cancel();
-            if (_rawDevice != null)
-            {
-                _rawDevice.DataAvailable -= WaveIn_DataAvailable;
-                _rawDevice.Dispose();
-                _rawDevice = null;
-            }
-            if (_waveWriter != null)
-            {
-                _waveWriter.Dispose();
-                _waveWriter = null;
-            }
-            if (_timer != null)
-            {
-                _timer.Stop();
-                _timer.Dispose();
-                _timer = null;
-            }
-        }
-
-        public void StartMonitoring(string deviceName, ScottPlot.WinForms.FormsPlot plot)
-        {
-            if (IsRunning) return;
             if (!_deviceNames.Contains(deviceName))
             {
-                Logging.Logger.Warn($"Device not found : {deviceName}");
+                Logging.Logger.Warn($"Device not found - {deviceName}");
                 return;
             }
 
             IsRunning = true;
 
-            Logging.Logger.Debug($"Noise Ratio (SNR) : -{NoiseRatio}");
+            Logging.Logger.Debug($"Setup device - {deviceName}");
 
-            _rawDevice = new WasapiCapture(_selectedDevice, true, BufferMilliseconds);
-            _rawDevice.DataAvailable += WaveIn_DataAvailable;
-            //var fmt = new WaveFormat(SampleRate, BitDepth, Channels);
-            //_rawDevice.WaveFormat = fmt;
+            Logging.Logger.Debug($"SNR = {SNR}");
 
-            //var fmt = _rawDevice.WaveFormat;
+            _capture = _device.DataFlow == DataFlow.Capture
+                ? new WasapiCapture(_device, true, BufferMilliseconds)
+                : new WasapiLoopbackCapture(_device);
+            _capture.DataAvailable += WaveIn_DataAvailable;
 
+            Logging.Logger.Debug($"Old format - {_capture.WaveFormat}");
             var fmt = this.Format;
-            _rawDevice.WaveFormat = fmt;
+            Logging.Logger.Debug($"Load format - {fmt}");
+            _capture.WaveFormat = fmt;
+            Logging.Logger.Debug($"New format - {_capture.WaveFormat}");
 
             _audioValues = new double[fmt.SampleRate / 10];
-            var window = new FftSharp.Windows.Hanning();
-            var windowed = window.Apply(_audioValues);
-            var paddedAudio = FftSharp.Pad.ZeroPad(windowed);
-            var spectrum = FftSharp.FFT.Forward(paddedAudio);
-            var fftPower = FftSharp.FFT.Power(spectrum);
-            _fftValues = new double[fftPower.Length];
-            var fftPeriod = FftSharp.FFT.FrequencyResolution(fftPower.Length, fmt.SampleRate);
-            _formsPlot = plot;
-            _formsPlot.Plot.Clear();
-            //_formsPlot.Plot.Add.Signal(_fftValues, 1.0 / fftPeriod);
-            //_formsPlot.Plot.Add.Signal(_fftValues, 2.0 * fftPower.Length / fmt.SampleRate);
-            _formsPlot.Plot.Add.Signal(_fftValues, fftPeriod);
-            _formsPlot.Plot.YLabel("Spectral Power");
-            _formsPlot.Plot.XLabel("Frequency (kHz)");
-            _formsPlot.Plot.Title($"{fmt.Encoding} ({fmt.BitsPerSample}-bit) {fmt.SampleRate} kHz");
-            _formsPlot.Plot.Axes.SetLimits(
-                -100, 
-                fmt.SampleRate, 
-                -200, 
-                0);
-            _formsPlot.Refresh();
+            var windowed = new FftSharp.Windows.Hanning().Apply(_audioValues);
+            var padded = FftSharp.Pad.ZeroPad(windowed);
+            var spectrum = FftSharp.FFT.Forward(padded);
+            var fftValues = FftSharp.FFT.Power(spectrum);
+            _fftValues = new double[fftValues.Length];
+
+            var fftPeriod = FftSharp.FFT.FrequencyResolution(fftValues.Length, fmt.SampleRate);
+            
+            if (plot != null)
+            {
+                Logging.Logger.Debug("Setup signal plot");
+
+                _signalPlot = plot;
+                _signalPlot.Plot.Clear();
+                _signalPlot.Plot.Add.Signal(_fftValues, fftPeriod);
+                _signalPlot.Plot.YLabel("Spectral Power");
+                _signalPlot.Plot.XLabel("Frequency (Hz)");
+                _signalPlot.Plot.Title($"{fmt.Encoding} ({fmt.BitsPerSample}-bit) {fmt.SampleRate} Hz");
+                _signalPlot.Plot.Axes.SetLimits(
+                    left: 0,
+                    right: fmt.SampleRate / 2,
+                    //right: 8000,
+                    bottom: SNR,
+                    top: 0);
+                _signalPlot.Plot.Add.VerticalLine(_targetFreq - _targetMargin, color: Colors.Red);
+                _signalPlot.Plot.Add.VerticalLine(_targetFreq + _targetMargin, color: Colors.Red);
+                _signalPlot.Plot.Add.HorizontalLine(0, color: Colors.Green, pattern: LinePattern.Dashed);
+                _signalPlot.Refresh();
+            }
 
             _timer = new System.Timers.Timer
             {
                 Interval = BufferMilliseconds,
-                AutoReset = true,
+                AutoReset = true
             };
             _timer.Elapsed += Timer_Elapsed;
 
-            _rawDevice.StartRecording();
+            Logging.Logger.Debug("Start capturing");
+            _capture.StartRecording();
             _timer.Start();
         }
 
-        public void StopMonitoring()
+        public void Stop()
         {
-            if (!IsRunning) return;
+            if (!IsRunning)
+            {
+                Logging.Logger.Warn("Already start");
+                return;
+            }
 
+            Logging.Logger.Debug("Stop capturing");
             IsRunning = false;
-            _rawDevice.StopRecording();
-            _rawDevice.DataAvailable -= WaveIn_DataAvailable;
-            _rawDevice.Dispose();
-            _rawDevice = null;
+            _signalPlot = null;
 
-            _timer.Stop();
-            _timer.Elapsed -= Timer_Elapsed;
-            _timer.Dispose();
-            _timer = null;
-
-            _formsPlot = null;
+            if (_capture != null)
+            {
+                _capture.DataAvailable -= WaveIn_DataAvailable;
+                _capture.StopRecording();
+                _capture.Dispose();
+            }
+            if (_timer != null)
+            {
+                _timer.Elapsed -= Timer_Elapsed;
+                _timer.Stop();
+                _timer.Dispose();
+            }
         }
 
         #region Private
         private static readonly Lazy<AudioManager> _instance = new Lazy<AudioManager>(() => new AudioManager());
         private AudioManager() { }
 
-        private List<MMDevice> _devices = new List<MMDevice>();
-        private List<string> _deviceNames = new List<string>();
-        private MMDevice _selectedDevice;
-        private WasapiCapture _rawDevice;
+        private readonly List<MMDevice> _devices = new List<MMDevice>();
+        private readonly List<string> _deviceNames = new List<string>();
+        private MMDevice _device;
+        private WasapiCapture _capture;
         private System.Timers.Timer _timer;
-        private CancellationTokenSource _cts;
-        private WaveFileWriter _waveWriter;
         private double[] _audioValues;
         private double[] _fftValues;
 
-        private ScottPlot.WinForms.FormsPlot _formsPlot;
+        private int _targetMargin = 100;
+        private int _targetFreq = 1000;
+
+        private int _dropFreq = 200;
+
+        private FormsPlot _signalPlot;
+
+        private double _averagePower;
 
         private string[] RefreshDevices()
         {
-            var devices = new MMDeviceEnumerator().EnumerateAudioEndPoints(DataFlow.Capture, DeviceState.Active);
+            var devices = new MMDeviceEnumerator().EnumerateAudioEndPoints(DataFlow.All, DeviceState.Active);
             _devices.Clear();
             _devices.AddRange(devices);
-            if (_selectedDevice != null || !_devices.Contains(_selectedDevice))
-            {
-                _selectedDevice = _devices.First();
-            }
             _deviceNames.Clear();
             _deviceNames.AddRange((from device in _devices select device.FriendlyName).ToArray());
             return _deviceNames.ToArray();
@@ -245,77 +212,93 @@ namespace AudioSample
 
         private void WaveIn_DataAvailable(object sender, WaveInEventArgs e)
         {
-            if (_waveWriter != null)
+            var fmt = _capture.WaveFormat;
+            var bytesPerSample = fmt.BitsPerSample / 8 * fmt.Channels;
+            var bufferCount = e.Buffer.Length / bytesPerSample;
+
+            if (bufferCount > _audioValues.Length)
+                bufferCount = _audioValues.Length;
+            
+            if (fmt.BitsPerSample == 16 && fmt.Encoding == WaveFormatEncoding.Pcm)
             {
-                // Recording
-                _waveWriter.Write(e.Buffer, 0, e.BytesRecorded);
-                _waveWriter.Flush();
+                for (int i = 0; i < bufferCount; i++)
+                {
+                    _audioValues[i] = BitConverter.ToInt16(e.Buffer, i * bytesPerSample) / Math.Pow(2, fmt.BitsPerSample - 1);
+                    //_audioValues[i] = BitConverter.ToInt16(e.Buffer, i * bytesPerSample);
+                }
+            }
+            else if (fmt.BitsPerSample == 32 && fmt.Encoding == WaveFormatEncoding.Pcm)
+            {
+                for (int i = 0; i < bufferCount; i++)
+                {
+                    _audioValues[i] = BitConverter.ToInt32(e.Buffer, i * bytesPerSample) / Math.Pow(2, fmt.BitsPerSample - 1);
+                    //_audioValues[i] = BitConverter.ToInt32(e.Buffer, i * bytesPerSample);
+                }
+            }
+            else if (fmt.BitsPerSample == 32 && fmt.Encoding == WaveFormatEncoding.IeeeFloat)
+            {
+                for (int i = 0; i < bufferCount; i++)
+                {
+                    _audioValues[i] = BitConverter.ToSingle(e.Buffer, i * bytesPerSample);
+                }
             }
             else
             {
-                // Monitoring
-                var fmt = _rawDevice.WaveFormat;
-                var bpsPerChannel = fmt.BitsPerSample / 8;
-                var bytesPerSample = bpsPerChannel * fmt.Channels;
-                var bufferCount = e.Buffer.Length / bytesPerSample;
-                if (bufferCount >= _audioValues.Length)
-                    bufferCount = _audioValues.Length;
-
-                if (bpsPerChannel == 2 && fmt.Encoding == WaveFormatEncoding.Pcm)
-                {
-                    for (int i = 0; i < bufferCount; i++)
-                        _audioValues[i] = BitConverter.ToInt16(e.Buffer, i * bytesPerSample);
-                }
-                else if (bpsPerChannel == 4 && fmt.Encoding == WaveFormatEncoding.Pcm)
-                {
-                    for (int i = 0; i < bufferCount; i++)
-                        _audioValues[i] = BitConverter.ToInt32(e.Buffer, i * bytesPerSample);
-                }
-                else if (bpsPerChannel == 4 && fmt.Encoding == WaveFormatEncoding.IeeeFloat)
-                {
-                    for (int i = 0; i < bufferCount; i++)
-                        _audioValues[i] = BitConverter.ToSingle(e.Buffer, i * bytesPerSample);
-                }
-                else
-                {
-                    throw new NotSupportedException(fmt.Encoding.ToString());
-                }
+                throw new NotSupportedException(fmt.Encoding.ToString());
             }
         }
 
         private void Timer_Elapsed(object sender, System.Timers.ElapsedEventArgs e)
         {
-            var fmt = _rawDevice.WaveFormat;
-            var window = new FftSharp.Windows.Hanning();
-            var windowed = window.Apply(_audioValues);
-            var paddedAudio = FftSharp.Pad.ZeroPad(windowed);
-            var spectrum = FftSharp.FFT.Forward(paddedAudio);
-            var fftPower = FftSharp.FFT.Power(spectrum);
-            Array.Copy(fftPower, _fftValues, fftPower.Length);
-            var fftFreq = FftSharp.FFT.FrequencyScale(fftPower.Length, fmt.SampleRate);
-            int peakIndex = 0;
-            for (int i = 0; i < fftPower.Length; i++)
-            {
-                if (fftPower[i] > fftPower[peakIndex])
-                    peakIndex = i;
-            }
-            //var fftPeriod = FftSharp.FFT.FrequencyResolution(fftPower.Length, fmt.SampleRate);
-            //var peakFreq = fftPeriod * peakIndex;
-            var peakFreq = fftFreq[peakIndex];
-            var peakPower = fftPower[peakIndex];
-            Logging.Logger.Debug($"Peak Frequency : {peakFreq:N0} Hz");
-            Logging.Logger.Debug($"Peak Power : {peakPower:N0}");
+            var fmt = _capture.WaveFormat;
 
-            if (_formsPlot != null)
+            var windowed = new FftSharp.Windows.Hanning().Apply(_audioValues);
+            var padded = FftSharp.Pad.ZeroPad(windowed);
+            var spectrum = FftSharp.FFT.Forward(padded);
+            var fftValues = FftSharp.FFT.Power(spectrum);
+
+            var fftPeriod = FftSharp.FFT.FrequencyResolution(fftValues.Length, fmt.SampleRate);
+            var fftFreq = FftSharp.FFT.FrequencyScale(fftValues.Length, fmt.SampleRate);
+
+            // filter
+            //var dropRange = (int)Math.Floor(_dropFreq / fftPeriod);
+            //for (int i = 0; i < dropRange; i++)
+            //{
+            //    fftValues[i] = SNR;
+            //}
+            //if (fmt.Encoding == WaveFormatEncoding.IeeeFloat && _audioValues.Max() > 1)
+
+            //if (windowed.Max() > 1)
+            //{
+            //    Logging.Logger.Debug($"Over : {windowed.Max()} / {windowed.Min()}");
+            //}
+
+            Array.Copy(fftValues, _fftValues, fftValues.Length);
+
+            var peakPower = fftValues.Max();
+            var peakIndex = fftValues.ToList().IndexOf(peakPower);
+            var peakFreq = peakIndex * fftPeriod;
+
+            _averagePower = fftValues.Average();
+
+            PeakValueChanged?.Invoke(peakFreq, peakPower);
+            FftValueChanged?.Invoke(_fftValues, fftPeriod);
+
+            _signalPlot?.BeginInvoke(new Action(() =>
             {
-                //var plotLimits = _formsPlot.Plot.Axes.GetLimits();
-                //_formsPlot.Plot.Axes.SetLimits(
-                //    -100, 
-                //    Math.Max(fmt.SampleRate / 2, plotLimits.Right),
-                //    Math.Min(fftPower.Min(), plotLimits.Bottom),
-                //    Math.Max(fftPower.Max(), plotLimits.Top));
-                _formsPlot?.BeginInvoke(new Action(() => _formsPlot?.Refresh()));
-            }
+                if (_signalPlot != null)
+                {
+                    var limits = _signalPlot.Plot.Axes.GetLimits();
+                    _signalPlot.Plot.Axes.SetLimits(
+                        bottom: Math.Min(limits.Bottom, _fftValues.Min() == double.NegativeInfinity ? SNR : _fftValues.Min()),
+                        top: Math.Max(limits.Top, _fftValues.Max()));
+                    foreach (var line in _signalPlot.Plot.GetPlottables<HorizontalLine>())
+                    {
+                        line.Y = _averagePower;
+                    }
+                }
+                _signalPlot?.Refresh();
+            }));
         }
         #endregion
     }

@@ -11,11 +11,12 @@ namespace AudioSample
 {
     internal sealed class Logging
     {
-        public static Logger Logger => LogManager.GetLogger("default");
+        public static Logger Logger => LogManager.GetCurrentClassLogger();
 
         public static void Setup()
         {
             var config = new LoggingConfiguration();
+            var datetime = DateTime.Now.ToString(@"yyMMdd_HH\:mm\:ss");
             var layout = string.Join(" | ", new[]
             {
                 @"${longdate}",
@@ -29,7 +30,7 @@ namespace AudioSample
             var logfile = new FileTarget
             {
                 Name = "logfile",
-                FileName = @"${basedir}/logs/${date:format=yyMMdd_HHmmss}.log",
+                FileName = @"${basedir}/logs/" + $"{datetime}.log",
                 Layout = layout,
             };
             var logconsole = new ConsoleTarget
@@ -42,7 +43,9 @@ namespace AudioSample
             config.AddRule(new LoggingRule("*", LogLevel.Debug, logconsole));
             config.AddTarget("logfile", logfile);
             config.AddTarget("logconsole", logconsole);
+
             LogManager.Configuration = config;
+            LogManager.ReconfigExistingLoggers();
         }
 
         #region Private
